@@ -49,11 +49,11 @@ fn main() {
     };
 
     let content = if let Some(expr) = &cmd.expr {
-        let (s, m) = MatcherChain::parse(&expr).unwrap();
+        let (s, m) = Selector::parse(&expr).unwrap();
         if !s.is_empty() {
             panic!("malformed expr");
         }
-        m.try_match(&content).unwrap()
+        Value::List(m.try_match(&content).collect())
     } else {
         content
     };

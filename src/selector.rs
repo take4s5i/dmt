@@ -1,57 +1,69 @@
 use crate::prelude::*;
 use nom::IResult;
 
-pub type MResult<T> = std::result::Result<T, MatcherError>;
+pub struct SelectorResult = Box<dyn std::iter::Iterator<Item = Value>>;
 
 #[derive(PartialEq, Eq, Debug)]
-pub struct MatcherError {
+pub struct SelectorError {
     msg: String
 }
 
 #[derive(PartialEq, Eq, Debug)]
-pub struct MatcherParseError {
+pub struct SelectorParseError {
     msg: String
 }
 
-macro_rules! matcher_err {
+macro_rules! selector_err {
     ($($expr: expr),+) => {
-        Err(MatcherError{ msg: std::format!($($expr),+) })
+        Box::new(Some(Err(SelectorError{ msg: std::format!($($expr),+) })))
     }
 }
 
-macro_rules! mname {
+macro_rules! empty_result {
+    () => {
+        Box::new(None.into_iter())
+    }
+}
+
+macro_rules! single_result {
     ($expr:expr) => {
-        Matcher::Name(NameMatcher(($expr).to_owned()))
+        Box::new(Some($expr).into_iter())
     }
 }
 
-macro_rules! mindex {
+macro_rules! sname {
     ($expr:expr) => {
-        Matcher::Index(IndexMatcher($expr))
+        UnionSelector::Name(NameSelector(($expr).to_owned()))
     }
 }
 
-macro_rules! mchain {
+macro_rules! sindex {
+    ($expr:expr) => {
+        UnionSelector::Index(IndexSelector($expr))
+    }
+}
+
+macro_rules! sel {
     [$($expr:expr),+] => {
-        MatcherChain(vec![
+        Selector::from_vec(vec![
             $($expr),+
         ])
     }
 }
 
-#[derive(PartialEq, Eq, Debug)]
-pub struct NameMatcher(String);
-impl NameMatcher {
-    fn try_match(&self, v: &Value) -> MResult<Value> {
+#[derive(PartialEq, Eq, Debug, Clone)]
+pub struct NameSelector(String);
+impl NameSelector {
+    fn try_match(&self, v: &Value) -> SelectorResult {
         match v {
             Value::Map(m) => {
                 if let Some(v) = m.get(&self.0) {
-                    Ok(v.clone())
+                    single_result!(v.clone())
                 } else {
-                    matcher_err!("map don't contains key what is '{}'", &(self.0))
+                    empty_result!()
                 }
             }
-            _ => matcher_err!("value isn't a map")
+            _ => empty_result!()
         }
     }
 
@@ -62,7 +74,7 @@ impl NameMatcher {
         };
         let mut parser = map_res(alphanumeric1, |s: &str| {
             if nom::character::is_alphabetic(s.bytes().nth(0).unwrap()) {
-                Ok(NameMatcher(s.to_owned()))
+                Ok(NameSelector(s.to_owned()))
             } else {
                 Err("name of field must starts with an alphabet.")
             }
@@ -72,19 +84,19 @@ impl NameMatcher {
     }
 }
 
-#[derive(PartialEq, Eq, Debug)]
-pub struct IndexMatcher(usize);
-impl IndexMatcher {
-    fn try_match(&self, v: &Value) -> MResult<Value> {
+#[derive(PartialEq, Eq, Debug, Clone)]
+pub struct IndexSelector(usize);
+impl IndexSelector {
+    fn try_match(&self, v: &Value) -> SelectorResult {
         match v {
             Value::List(ls) => {
                 if self.0 < ls.len() {
-                    Ok(ls[self.0].clone())
+                    single_result!(ls[self.0].clone())
                 } else {
-                    matcher_err!("out of index what is {}", self.0)
+                    empty_result!()
                 }
             }
-            _ => matcher_err!("value isn't a list")
+            _ => empty_result!()
         }
     }
 
@@ -98,7 +110,7 @@ impl IndexMatcher {
         let mut parser = delimited(
             tag("["),
             map_res(digit1, |s: &str| {
-                s.parse::<usize>().map(|idx| IndexMatcher(idx))
+                s.parse::<usize>().map(|idx| IndexSelector(idx))
             }),
             tag("]"),
         );
@@ -106,17 +118,17 @@ impl IndexMatcher {
     }
 }
 
-#[derive(PartialEq, Eq, Debug)]
-pub enum Matcher {
-    Name(NameMatcher),
-    Index(IndexMatcher),
+#[derive(PartialEq, Eq, Debug, Clone)]
+pub enum UnionSelector {
+    Name(NameSelector),
+    Index(IndexSelector),
 }
 
-impl Matcher {
-    fn try_match(&self, v: &Value) -> MResult<Value> {
+impl UnionSelector {
+    fn try_match(&self, v: &Value) -> SelectorResult {
         match self {
-            Matcher::Name(m) => m.try_match(v),
-            Matcher::Index(m) => m.try_match(v),
+            Self::Name(m) => m.try_match(v),
+            Self::Index(m) => m.try_match(v),
         }
     }
 
@@ -126,24 +138,41 @@ impl Matcher {
             combinator::*,
         };
         let mut parser = alt((
-            map(NameMatcher::parse, |m| Matcher::Name(m)),
-            map(IndexMatcher::parse, |m| Matcher::Index(m)),
+            map(NameSelector::parse, |m| Self::Name(m)),
+            map(IndexSelector::parse, |m| Self::Index(m)),
         ));
 
         parser(input)
     }
 }
 
-#[derive(PartialEq, Eq, Debug)]
-pub struct MatcherChain(Vec<Matcher>);
 
-impl MatcherChain {
-    pub fn try_match(&self, v: &Value) -> MResult<Value> {
-        let mut v = v.clone();
-        for m in self.0.iter() {
-            v = m.try_match(&v)?;
+#[derive(PartialEq, Eq, Debug, Clone)]
+pub enum Selector {
+    Nil,
+    Node(UnionSelector, Box<Selector>),
+}
+
+impl Selector {
+    pub fn from_vec(sels: Vec<UnionSelector>) -> Selector {
+        let mut sel = Self::Nil;
+
+        for uni in sels.into_iter().rev() {
+            sel = Self::Node(uni, Box::new(sel));
         }
-        Ok(v)
+
+        sel
+    }
+
+    pub fn try_match(&self, v: &Value) -> SelectorResult {
+        match self.clone() {
+            Self::Nil => single_result!(v.clone()),
+            Self::Node(sel, next) => {
+                let iter = sel.try_match(v)
+                    .flat_map(move |child| next.try_match(&child));
+                Box::new(iter)
+            },
+        }
     }
 
     pub fn parse(input: &str) -> IResult<&str, Self> {
@@ -153,8 +182,8 @@ impl MatcherChain {
             combinator::*,
         };
         let mut parser = map(
-            separated_list1(tag("."), Matcher::parse),
-            |vec| MatcherChain(vec),
+            separated_list1(tag("."), UnionSelector::parse),
+            |vec| Selector::from_vec(vec),
         );
 
         parser(input)
@@ -165,66 +194,77 @@ impl MatcherChain {
 mod test {
     use super::*;
     use crate::*;
-    mod name_matcher {
+    mod name_selector {
         use super::*;
 
         #[test]
         fn try_match() {
-            let m = NameMatcher("hoge".to_owned());
+            let m = NameSelector("hoge".to_owned());
             let v = vmap!{
                 "hoge" => vint!(10)
             };
-            assert!(m.try_match(&vunit!()).is_err());
-            assert_eq!(m.try_match(&v).unwrap(), vint!(10));
+
+            let res: Vec<_> = m.try_match(&vunit!()).collect();
+            assert!(res.is_empty());
+
+            let res: Vec<_> = m.try_match(&v).collect();
+            assert_eq!(res.len(), 1);
+            assert_eq!(res[0], vint!(10));
         }
 
         #[test]
         fn parse() {
-            let res = NameMatcher::parse("hoge1234");
+            let res = NameSelector::parse("hoge1234");
             assert_eq!(res, Ok(
-                ("", NameMatcher("hoge1234".to_owned()))
+                ("", NameSelector("hoge1234".to_owned()))
             ));
 
-            let res = NameMatcher::parse("1234hoge");
+            let res = NameSelector::parse("1234hoge");
             assert!(res.is_err());
         }
     }
 
-    mod index_matcher {
+    mod index_selector {
         use super::*;
 
         #[test]
         fn try_match() {
-            let m1 = IndexMatcher(1);
-            let m10 = IndexMatcher(10);
+            let m1 = IndexSelector(1);
+            let m10 = IndexSelector(10);
             let v = vlist![
                 vint!(1),
                 vint!(2),
                 vint!(3)
             ];
 
-            assert!(m1.try_match(&vunit!()).is_err());
-            assert_eq!(m1.try_match(&v).unwrap(), vint!(2));
-            assert!(m10.try_match(&v).is_err());
+            let res: Vec<_> = m1.try_match(&vunit!()).collect();
+            assert!(res.is_empty());
+
+            let res: Vec<_> = m1.try_match(&v).collect();
+            assert_eq!(res.len(), 1);
+            assert_eq!(res[0], vint!(2));
+
+            let res: Vec<_> = m10.try_match(&v).collect();
+            assert!(res.is_empty());
         }
 
         #[test]
         fn parse() {
-            let res = IndexMatcher::parse("[0]");
+            let res = IndexSelector::parse("[0]");
             assert_eq!(res, Ok(
-                ("", IndexMatcher(0))
+                ("", IndexSelector(0))
             ));
         }
     }
 
-    mod matcher_chain {
+    mod selector {
         use super::*;
 
         #[test]
         fn try_match() {
-            let m = mchain![
-                mname!("hoge"),
-                mindex!(0)
+            let m = sel![
+                sname!("hoge"),
+                sindex!(0)
             ];
 
             let v = vmap!{
@@ -233,16 +273,18 @@ mod test {
                 ]
             };
 
-            assert_eq!(m.try_match(&v), Ok(vint!(10)));
+            let res: Vec<_> = m.try_match(&v).collect();
+            assert_eq!(res.len(), 1);
+            assert_eq!(res[0], vint!(10));
         }
 
         #[test]
         fn parse() {
-            let (rest, res) = MatcherChain::parse("hoge.[0]").unwrap();
+            let (rest, res) = Selector::parse("hoge.[0]").unwrap();
             assert_eq!(rest, "");
-            assert_eq!(res, mchain![
-                mname!("hoge"),
-                mindex!(0)
+            assert_eq!(res, sel![
+                sname!("hoge"),
+                sindex!(0)
             ]);
         }
     }
